@@ -1,14 +1,11 @@
 /*
  * Custom USB HID interface that exposes the left and right split-half
- * battery levels of a ZMK split keyboard to the host. Used by the
- * zmk-split-battery-tray GNOME Shell extension on Linux to render
- * battery percentages in the top bar.
+ * battery levels of a ZMK split keyboard to the host.
  *
  * Lives on the dongle (central) build only. Subscribes to ZMK's
- * peripheral battery events (which fire when
- * CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING is enabled) and
- * pushes a 2-byte input report to a second USB HID interface (HID_1)
- * every time a value changes.
+ * peripheral battery events (CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
+ * and also periodically refreshes/resends so a late-opening host still
+ * sees levels (interrupt-IN completion can stall if nothing was reading).
  *
  * Report layout (Report ID 0x01):
  *     byte 0: left battery state of charge  (0..100, 0xFF = unknown)
@@ -24,11 +21,13 @@
 
 #include <zmk/event_manager.h>
 #include <zmk/events/battery_state_changed.h>
+#include <zmk/split/central.h>
 
 LOG_MODULE_REGISTER(zmk_split_battery, CONFIG_ZMK_LOG_LEVEL);
 
 #define REPORT_ID_BATTERY 0x01
 #define BATTERY_UNKNOWN   0xFF
+#define RESEND_INTERVAL_MS 5000
 
 static const uint8_t hid_report_desc[] = {
     0x06, 0x00, 0xFF, /* Usage Page (Vendor-Defined 0xFF00)             */
@@ -48,10 +47,10 @@ static const uint8_t hid_report_desc[] = {
 
 static const struct device *hid_dev;
 static K_SEM_DEFINE(report_sem, 1, 1);
-static uint8_t levels[2] = { BATTERY_UNKNOWN, BATTERY_UNKNOWN };
+static uint8_t levels[2] = {BATTERY_UNKNOWN, BATTERY_UNKNOWN};
+static struct k_work_delayable resend_work;
 
-static void int_in_ready_cb(const struct device *dev)
-{
+static void int_in_ready_cb(const struct device *dev) {
     ARG_UNUSED(dev);
     k_sem_give(&report_sem);
 }
@@ -60,27 +59,59 @@ static const struct hid_ops ops = {
     .int_in_ready = int_in_ready_cb,
 };
 
-static int send_report(void)
-{
+static void recover_report_sem(void) {
+    /* If a prior IN transfer never completed (no host reader), unlock. */
+    if (k_sem_take(&report_sem, K_NO_WAIT) != 0) {
+        k_sem_reset(&report_sem);
+        k_sem_give(&report_sem);
+    } else {
+        k_sem_give(&report_sem);
+    }
+}
+
+static int send_report(void) {
     if (!hid_dev) {
         return -ENODEV;
     }
-    uint8_t buf[3] = { REPORT_ID_BATTERY, levels[0], levels[1] };
 
-    if (k_sem_take(&report_sem, K_MSEC(100)) != 0) {
-        LOG_WRN("battery report semaphore busy");
-        return -EBUSY;
+    uint8_t buf[3] = {REPORT_ID_BATTERY, levels[0], levels[1]};
+
+    if (k_sem_take(&report_sem, K_MSEC(50)) != 0) {
+        LOG_WRN("battery report semaphore busy — recovering");
+        recover_report_sem();
+        if (k_sem_take(&report_sem, K_NO_WAIT) != 0) {
+            return -EBUSY;
+        }
     }
+
     int err = hid_int_ep_write(hid_dev, buf, sizeof(buf), NULL);
     if (err) {
         k_sem_give(&report_sem);
-        LOG_ERR("hid_int_ep_write failed: %d", err);
+        LOG_DBG("hid_int_ep_write failed: %d", err);
     }
     return err;
 }
 
-static int zmk_split_battery_hid_init(void)
-{
+static void refresh_from_central(void) {
+    for (uint8_t i = 0; i < ARRAY_SIZE(levels); i++) {
+        uint8_t level = BATTERY_UNKNOWN;
+        if (zmk_split_central_get_peripheral_battery_level(i, &level) == 0) {
+            /* Central cache starts at 0 before the first BAS notify. */
+            if (level > 0 || levels[i] != BATTERY_UNKNOWN) {
+                levels[i] = level;
+            }
+        }
+    }
+}
+
+static void resend_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    refresh_from_central();
+    send_report();
+    k_work_schedule(&resend_work, K_MSEC(RESEND_INTERVAL_MS));
+}
+
+static int zmk_split_battery_hid_init(void) {
     hid_dev = device_get_binding("HID_1");
     if (!hid_dev) {
         LOG_ERR("device_get_binding(HID_1) returned NULL — "
@@ -93,14 +124,17 @@ static int zmk_split_battery_hid_init(void)
         LOG_ERR("usb_hid_init(HID_1) failed: %d", err);
         return err;
     }
+
+    k_work_init_delayable(&resend_work, resend_work_handler);
+    k_work_schedule(&resend_work, K_MSEC(1500));
+
     LOG_INF("split battery HID interface initialized on HID_1");
     return 0;
 }
 
 SYS_INIT(zmk_split_battery_hid_init, APPLICATION, 91);
 
-static int battery_listener(const zmk_event_t *eh)
-{
+static int battery_listener(const zmk_event_t *eh) {
     const struct zmk_peripheral_battery_state_changed *ev =
         as_zmk_peripheral_battery_state_changed(eh);
     if (!ev) {
