@@ -176,3 +176,24 @@ gnome-extensions prefs zmk-split-battery@bogamie.github.io
 [MIT](./LICENSE) — see file. The firmware patch consumes ZMK and
 Zephyr APIs but contains no copied code; ZMK itself is MIT and Zephyr
 is Apache-2.0, both compatible.
+
+## HttpKiwi / Kiwiboard notes
+
+This fork targets a **niri + Quickshell** host (not GNOME Shell). The
+GNOME extension under `extension/` is kept for upstream parity; the
+active host path here is:
+
+1. Firmware patch (same as upstream) in `zmk-config` `corne_dongle` shield
+2. `host/zmk-split-battery.py` — reads the vendor HID report from `/dev/hidraw*`
+3. Quickshell `KeyboardBatteryIndicator` (in `~/.config/quickshell`) which
+   polls that script every 5s
+
+Install the udev rule once so the session user can read hidraw:
+
+```sh
+sudo cp udev/99-zmk-split-battery.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then rebuild/flash the **dongle** (and halves if battery fetch was newly
+enabled), replug, and reload Quickshell (`qs` restart).
